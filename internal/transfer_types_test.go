@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,6 +15,7 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/api/workflowservicemock/v1"
 	"go.temporal.io/sdk/converter"
@@ -27,83 +27,115 @@ import (
 
 // -- DATA --
 
-// temperature is a struct with no exported fields and its transfer type is a float64.
-type temperature struct{ kelvin float64 }
+// temperature keeps its state private and transfers as a float64.
+type temperature struct {
+	TransferTypeConvertible[temperature, float64, temperatureConverter]
+	kelvin float64
+}
 
-func (temperature) TransferTypeConverter() TransferTypeConverter {
-	return NewTransferTypeConverter(
-		func(t *temperature) (*float64, error) {
-			return &t.kelvin, nil
-		},
-		func(kelvin *float64, t *temperature) error {
-			t.kelvin = *kelvin
-			return nil
-		},
-	)
+type temperatureConverter struct{}
+
+func (temperatureConverter) ToTransfer(_ context.Context, t *temperature) (*float64, error) {
+	return &t.kelvin, nil
+}
+
+func (temperatureConverter) FromTransfer(_ context.Context, kelvin *float64, t *temperature) error {
+	t.kelvin = *kelvin
+	return nil
+}
+
+func (temperatureConverter) ToTransferWithWorkflowContext(_ Context, t *temperature) (*float64, error) {
+	return &t.kelvin, nil
+}
+
+func (temperatureConverter) FromTransferWithWorkflowContext(_ Context, kelvin *float64, t *temperature) error {
+	t.kelvin = *kelvin
+	return nil
 }
 
 // unencodable always returns an error during transfer-type-encoding.
-type unencodable struct{}
+type unencodable struct {
+	TransferTypeConvertible[unencodable, string, unencodableConverter]
+}
 
 var errNoEncoding = errors.New("cannot encode")
 
-func (unencodable) TransferTypeConverter() TransferTypeConverter {
-	return NewTransferTypeConverter(
-		func(*unencodable) (*string, error) { return nil, errNoEncoding },
-		func(*string, *unencodable) error { return nil },
-	)
+type unencodableConverter struct{}
+
+func (unencodableConverter) ToTransfer(context.Context, *unencodable) (*string, error) {
+	return nil, errNoEncoding
+}
+func (unencodableConverter) FromTransfer(context.Context, *string, *unencodable) error { return nil }
+
+func (unencodableConverter) ToTransferWithWorkflowContext(Context, *unencodable) (*string, error) {
+	return nil, errNoEncoding
+}
+
+func (unencodableConverter) FromTransferWithWorkflowContext(Context, *string, *unencodable) error {
+	return nil
 }
 
 // undecodable always returns an error during transfer-type-decoding.
-type undecodable struct{}
+type undecodable struct {
+	TransferTypeConvertible[undecodable, string, undecodableConverter]
+}
 
 var errNoDecoding = errors.New("cannot decode")
 
-func (undecodable) TransferTypeConverter() TransferTypeConverter {
-	return NewTransferTypeConverter(
-		func(*undecodable) (*string, error) {
-			encoded := "encoded"
-			return &encoded, nil
-		},
-		func(*string, *undecodable) error { return errNoDecoding },
-	)
+type undecodableConverter struct{}
+
+func (undecodableConverter) ToTransfer(context.Context, *undecodable) (*string, error) {
+	encoded := "encoded"
+	return &encoded, nil
 }
 
-// contextualString has a transfer type converter that looks for [transferContextKey]
-// in the context to compute the transfer type.
-type contextualString string
+func (undecodableConverter) FromTransfer(context.Context, *string, *undecodable) error {
+	return errNoDecoding
+}
+
+func (undecodableConverter) ToTransferWithWorkflowContext(Context, *undecodable) (*string, error) {
+	encoded := "encoded"
+	return &encoded, nil
+}
+
+func (undecodableConverter) FromTransferWithWorkflowContext(Context, *string, *undecodable) error {
+	return errNoDecoding
+}
+
+// contextualString transfers with a label from the current execution context.
+type contextualString struct {
+	TransferTypeConvertible[contextualString, string, contextualStringConverter]
+	Value string
+}
 
 type transferContextKey struct{}
+type contextualStringConverter struct{}
 
-func (contextualString) TransferTypeConverter() TransferTypeConverter {
-	return NewContextAwareTransferTypeConverter(
-		func(value *contextualString) (*string, error) {
-			transferType := fmt.Sprintf("go::%s", string(*value))
-			return &transferType, nil
-		},
-		func(transferType *string, value *contextualString) error {
-			*value = contextualString(strings.Split(*transferType, ":")[2])
-			return nil
-		},
-		func(ctx context.Context, value *contextualString) (*string, error) {
-			label, _ := ctx.Value(transferContextKey{}).(string)
-			transferType := fmt.Sprintf("go:%s:%s", label, string(*value))
-			return &transferType, nil
-		},
-		func(ctx context.Context, transferType *string, value *contextualString) error {
-			*value = contextualString(strings.Split(*transferType, ":")[2])
-			return nil
-		},
-		func(ctx Context, value *contextualString) (*string, error) {
-			label, _ := ctx.Value(transferContextKey{}).(string)
-			transferType := fmt.Sprintf("wf:%s:%s", label, string(*value))
-			return &transferType, nil
-		},
-		func(ctx Context, transferType *string, value *contextualString) error {
-			*value = contextualString(strings.Split(*transferType, ":")[2])
-			return nil
-		},
-	)
+func (contextualStringConverter) ToTransfer(ctx context.Context, value *contextualString) (*string, error) {
+	label, _ := ctx.Value(transferContextKey{}).(string)
+	transfer := "go:" + label + ":" + value.Value
+	return &transfer, nil
+}
+func (contextualStringConverter) FromTransfer(ctx context.Context, transfer *string, value *contextualString) error {
+	label, _ := ctx.Value(transferContextKey{}).(string)
+	if !strings.HasPrefix(*transfer, "go:"+label+":") {
+		return fmt.Errorf("unexpected Go context label %q for %q", label, *transfer)
+	}
+	value.Value = strings.Split(*transfer, ":")[2]
+	return nil
+}
+func (contextualStringConverter) ToTransferWithWorkflowContext(ctx Context, value *contextualString) (*string, error) {
+	label, _ := ctx.Value(transferContextKey{}).(string)
+	transfer := "wf:" + label + ":" + value.Value
+	return &transfer, nil
+}
+func (contextualStringConverter) FromTransferWithWorkflowContext(ctx Context, transfer *string, value *contextualString) error {
+	label, _ := ctx.Value(transferContextKey{}).(string)
+	if !strings.HasPrefix(*transfer, "wf:"+label+":") {
+		return fmt.Errorf("unexpected workflow context label %q for %q", label, *transfer)
+	}
+	value.Value = strings.Split(*transfer, ":")[2]
+	return nil
 }
 
 // transferEnvelope is a struct that contains a transfer-convertible field,
@@ -158,7 +190,6 @@ func TestTransferAwareDataConverter_PointerValueRoundTrip(t *testing.T) {
 	dc := defaultTransferAwareDataConverter
 	want := &temperature{kelvin: 300}
 
-	require.Implements(t, (*ValueWithTransferTypeConverter)(nil), want)
 	payload, err := dc.ToPayload(want)
 	require.NoError(t, err)
 
@@ -230,19 +261,6 @@ func TestTransferAwareDataConverter_DoublePointerDecoding(t *testing.T) {
 			})
 		})
 	}
-}
-
-func TestNewTransferTypeConverter_RejectsPointerModelType(t *testing.T) {
-	modelType := reflect.TypeFor[*temperature]()
-	require.PanicsWithValue(t,
-		fmt.Sprintf("transfer type converter: ModelType must not be a pointer, got %v", modelType),
-		func() {
-			NewTransferTypeConverter(
-				func(**temperature) (*float64, error) { return nil, nil },
-				func(*float64, **temperature) error { return nil },
-			)
-		},
-	)
 }
 
 func TestTransferAwareDataConverter_PayloadsRoundTrip(t *testing.T) {
@@ -410,7 +428,7 @@ func TestTransferAwareDataConverter_ConversionContext(t *testing.T) {
 	requireRoundTrip := func(t *testing.T, dc converter.DataConverter, wantPrefix string) {
 		t.Helper()
 
-		payload, err := dc.ToPayload(contextualString("value"))
+		payload, err := dc.ToPayload(contextualString{Value: "value"})
 		require.NoError(t, err)
 		want, err := parent.ToPayload(wantPrefix + "value")
 		require.NoError(t, err)
@@ -418,9 +436,9 @@ func TestTransferAwareDataConverter_ConversionContext(t *testing.T) {
 
 		var got contextualString
 		require.NoError(t, dc.FromPayload(payload, &got))
-		require.Equal(t, contextualString("value"), got)
+		require.Equal(t, contextualString{Value: "value"}, got)
 
-		payloads, err := dc.ToPayloads(contextualString("one"), contextualString("two"))
+		payloads, err := dc.ToPayloads(contextualString{Value: "one"}, contextualString{Value: "two"})
 		require.NoError(t, err)
 		wants, err := parent.ToPayloads(wantPrefix+"one", wantPrefix+"two")
 		require.NoError(t, err)
@@ -429,10 +447,17 @@ func TestTransferAwareDataConverter_ConversionContext(t *testing.T) {
 
 		var gotOne, gotTwo contextualString
 		require.NoError(t, dc.FromPayloads(payloads, &gotOne, &gotTwo))
-		require.Equal(t, contextualString("one"), gotOne)
-		require.Equal(t, contextualString("two"), gotTwo)
+		require.Equal(t, contextualString{Value: "one"}, gotOne)
+		require.Equal(t, contextualString{Value: "two"}, gotTwo)
 	}
 
+	t.Run("base", func(t *testing.T) {
+		requireRoundTrip(t, makeTransferAware(nil), "go::")
+	})
+	t.Run("Go context", func(t *testing.T) {
+		ctx := context.WithValue(t.Context(), transferContextKey{}, "client")
+		requireRoundTrip(t, makeTransferAware(nil).WithContext(ctx), "go:client:")
+	})
 	t.Run("workflow context", func(t *testing.T) {
 		ctx := WithValue(Background(), transferContextKey{}, "workflow")
 		requireRoundTrip(t, defaultTransferAwareDataConverter.WithWorkflowContext(ctx), "wf:workflow:")
@@ -462,19 +487,19 @@ func TestTransferTypesMockClientWorkflowInput(t *testing.T) {
 		{
 			name:     "workflow args use transfer type converters when available",
 			workflow: func(Context, string, temperature, temperature, transferEnvelope) error { return nil },
-			args:     []any{"plain", temperature{kelvin: 300}, temperature{kelvin: 275}, transferEnvelope{Value: "value"}},
-			wireArgs: []any{"plain", 300.0, 275.0, map[string]string{"Value": "value"}},
+			args:     []any{"plain", temperature{kelvin: 300}, temperature{kelvin: 275}, transferEnvelope{Value: contextualString{Value: "value"}}},
+			wireArgs: []any{"plain", 300.0, 275.0, map[string]any{"Value": map[string]string{"Value": "value"}}},
 		},
 		{
 			name:     "nested values are not transfer-converted",
 			workflow: func(Context, transferEnvelope, []contextualString, map[string]contextualString) error { return nil },
-			args:     []any{transferEnvelope{Value: "value"}, []contextualString{"value"}, map[string]contextualString{"key": "value"}},
-			wireArgs: []any{map[string]string{"Value": "value"}, []string{"value"}, map[string]string{"key": "value"}},
+			args:     []any{transferEnvelope{Value: contextualString{Value: "value"}}, []contextualString{{Value: "value"}}, map[string]contextualString{"key": {Value: "value"}}},
+			wireArgs: []any{map[string]any{"Value": map[string]string{"Value": "value"}}, []map[string]string{{"Value": "value"}}, map[string]any{"key": map[string]string{"Value": "value"}}},
 		},
 		{
 			name:     "client context reaches transfer type converter",
 			workflow: func(Context, contextualString) error { return nil },
-			args:     []any{contextualString("value")},
+			args:     []any{contextualString{Value: "value"}},
 			wireArgs: []any{"go:client:value"},
 		},
 	} {
@@ -508,8 +533,8 @@ func TestTransferTypesMockClientWorkflowResult(t *testing.T) {
 		{"requested model type", 300.0, new(temperature), &temperature{kelvin: 300}},
 		{"plain destination", "value", new(string), new("value")},
 		{"any destination", 300.0, new(any), new(any(300.0))},
-		{"nested values", map[string]string{"Value": "value"}, new(transferEnvelope), &transferEnvelope{Value: "value"}},
-		{"client context", "go:client:value", new(contextualString), new(contextualString("value"))},
+		{"nested values", map[string]any{"Value": map[string]string{"Value": "value"}}, new(transferEnvelope), &transferEnvelope{Value: contextualString{Value: "value"}}},
+		{"result decoding without execution context", "go::value", new(contextualString), new(contextualString{Value: "value"})},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dc := converter.GetDefaultDataConverter()
@@ -536,18 +561,29 @@ func TestTransferTypesMockClientWorkflowResult(t *testing.T) {
 
 // transferExecution's transfer type includes its unexported fields. When encoded with a data
 // converter that isn't transfer-aware, the fields disappear.
-type transferExecution struct{ workflowID, runID string }
+type transferExecution struct {
+	TransferTypeConvertible[transferExecution, commonpb.WorkflowExecution, transferExecutionConverter]
+	workflowID, runID string
+}
 
-func (transferExecution) TransferTypeConverter() TransferTypeConverter {
-	return NewTransferTypeConverter(
-		func(value *transferExecution) (*commonpb.WorkflowExecution, error) {
-			return &commonpb.WorkflowExecution{WorkflowId: value.workflowID, RunId: value.runID}, nil
-		},
-		func(value *commonpb.WorkflowExecution, result *transferExecution) error {
-			*result = transferExecution{workflowID: value.GetWorkflowId(), runID: value.GetRunId()}
-			return nil
-		},
-	)
+type transferExecutionConverter struct{}
+
+func (transferExecutionConverter) ToTransfer(_ context.Context, value *transferExecution) (*commonpb.WorkflowExecution, error) {
+	return &commonpb.WorkflowExecution{WorkflowId: value.workflowID, RunId: value.runID}, nil
+}
+
+func (transferExecutionConverter) FromTransfer(_ context.Context, value *commonpb.WorkflowExecution, result *transferExecution) error {
+	*result = transferExecution{workflowID: value.GetWorkflowId(), runID: value.GetRunId()}
+	return nil
+}
+
+func (transferExecutionConverter) ToTransferWithWorkflowContext(_ Context, value *transferExecution) (*commonpb.WorkflowExecution, error) {
+	return &commonpb.WorkflowExecution{WorkflowId: value.workflowID, RunId: value.runID}, nil
+}
+
+func (transferExecutionConverter) FromTransferWithWorkflowContext(_ Context, value *commonpb.WorkflowExecution, result *transferExecution) error {
+	*result = transferExecution{workflowID: value.GetWorkflowId(), runID: value.GetRunId()}
+	return nil
 }
 
 func TestTransferTypesWorkflowTestEnvironmentRoundTrip(t *testing.T) {
@@ -590,7 +626,7 @@ func TestTransferTypesWorkflowTestEnvironmentWorkflowRoundTrip(t *testing.T) {
 			workflow: func(_ Context, input transferEnvelope) (transferEnvelope, error) {
 				return input, nil
 			},
-			input: transferEnvelope{Value: "value"}, resultPtr: new(transferEnvelope), want: &transferEnvelope{Value: "value"},
+			input: transferEnvelope{Value: contextualString{Value: "value"}}, resultPtr: new(transferEnvelope), want: &transferEnvelope{Value: contextualString{Value: "value"}},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -650,7 +686,7 @@ func TestTransferTypesWorkflowTestEnvironmentExecutionConversionContext(t *testi
 			BackgroundActivityContext: context.WithValue(t.Context(), transferContextKey{}, "activity"),
 		})
 		activity := func(context.Context) (contextualString, error) {
-			return contextualString("value"), nil
+			return contextualString{Value: "value"}, nil
 		}
 		env.RegisterActivity(activity)
 		env.ExecuteWorkflow(func(ctx Context) (string, error) {
@@ -682,7 +718,7 @@ func TestTransferTypesWorkflowTestEnvironmentExecutionConversionContext(t *testi
 			})
 			var got contextualString
 			err := ExecuteActivity(ctx, activity).Get(ctx, &got)
-			return string(got), err
+			return got.Value, err
 		})
 		require.True(t, env.IsWorkflowCompleted())
 		require.NoError(t, env.GetWorkflowError())
@@ -711,6 +747,8 @@ func TestTransferTypes_DataConverterWrapping(t *testing.T) {
 
 	t.Run("workflow context", func(t *testing.T) {
 		ctx := WithDataConverter(Background(), converter.GetDefaultDataConverter())
+		options := getWorkflowEnvOptions(ctx)
+		require.Same(t, options.DataConverter, options.RootDataConverter)
 		dc := GetDataConverterFromWorkflowContext(ctx)
 
 		var got temperature
@@ -727,4 +765,137 @@ func TestTransferTypes_DataConverterWrapping(t *testing.T) {
 		require.NoError(t, newEncodedValues(payloads, converter.GetDefaultDataConverter()).Get(&encodedValues))
 		require.Equal(t, value, encodedValues)
 	})
+}
+
+func (s *TaskHandlersTestSuite) TestTransferTypesWorkflowBoundaryInvalidMarker() {
+	for _, test := range []struct {
+		name     string
+		workflow any
+	}{
+		{"encode", func(ctx Context) error {
+			ctx = WithActivityOptions(ctx, ActivityOptions{StartToCloseTimeout: time.Minute})
+			return ExecuteActivity(ctx, "unused", wrongMarker{}).Get(ctx, nil)
+		}},
+		{"decode", func(Context, wrongMarker) error { return nil }},
+	} {
+		s.Run(test.name, func() {
+			s.registry.RegisterWorkflowWithOptions(test.workflow, RegisterWorkflowOptions{Name: test.name})
+			input, err := converter.GetDefaultDataConverter().ToPayloads("transfer")
+			s.Require().NoError(err)
+			events := []*historypb.HistoryEvent{
+				createTestEventWorkflowExecutionStarted(1, &historypb.WorkflowExecutionStartedEventAttributes{
+					Input: input, TaskQueue: &taskqueuepb.TaskQueue{Name: testWorkflowTaskTaskqueue},
+				}),
+				createTestEventWorkflowTaskScheduled(2, &historypb.WorkflowTaskScheduledEventAttributes{}),
+				createTestEventWorkflowTaskStarted(3),
+			}
+			params := s.getTestWorkerExecutionParams()
+			s.Require().Equal(BlockWorkflow, params.WorkflowPanicPolicy)
+			handler := newWorkflowTaskHandler(params, nil, s.registry)
+			task := workflowTask{task: createWorkflowTask(events, 3, test.name)}
+			ctx := s.mustWorkflowContextImpl(&task, handler)
+			completion, err := handler.ProcessWorkflowTask(&task, ctx, nil)
+			ctx.Unlock(err)
+			s.Require().IsType(&workflowPanicError{}, err)
+			s.ErrorContains(err, "must match enclosing struct")
+			s.Nil(completion)
+		})
+	}
+}
+
+var (
+	_ TransferTypeConverter[temperature, float64]                          = temperatureConverter{}
+	_ TransferTypeConverter[unencodable, string]                           = unencodableConverter{}
+	_ TransferTypeConverter[undecodable, string]                           = undecodableConverter{}
+	_ TransferTypeConverter[contextualString, string]                      = contextualStringConverter{}
+	_ TransferTypeConverter[transferExecution, commonpb.WorkflowExecution] = transferExecutionConverter{}
+)
+
+// contextDispatchModel records the context delivered by the required methods.
+type contextDispatchModel struct {
+	TransferTypeConvertible[contextDispatchModel, string, contextDispatchConverter]
+	goContext       context.Context
+	workflowContext Context
+}
+
+type contextDispatchConverter struct{}
+
+var _ TransferTypeConverter[contextDispatchModel, string] = contextDispatchConverter{}
+
+func (contextDispatchConverter) ToTransfer(ctx context.Context, value *contextDispatchModel) (*string, error) {
+	if ctx == nil || ctx != value.goContext {
+		return nil, fmt.Errorf("unexpected Go context: %v", ctx)
+	}
+	return new("go"), nil
+}
+
+func (contextDispatchConverter) FromTransfer(ctx context.Context, _ *string, value *contextDispatchModel) error {
+	value.goContext = ctx
+	return nil
+}
+
+func (contextDispatchConverter) ToTransferWithWorkflowContext(ctx Context, value *contextDispatchModel) (*string, error) {
+	if ctx == nil || ctx != value.workflowContext {
+		return nil, fmt.Errorf("unexpected workflow context: %v", ctx)
+	}
+	return new("workflow"), nil
+}
+
+func (contextDispatchConverter) FromTransferWithWorkflowContext(ctx Context, _ *string, value *contextDispatchModel) error {
+	value.workflowContext = ctx
+	return nil
+}
+
+func TestTransferTypeConvertibleRequiredContextDispatch(t *testing.T) {
+	base := makeTransferAware(nil)
+	goCtx := t.Context()
+	wfCtx := WithValue(Background(), transferContextKey{}, "workflow")
+
+	for _, tt := range []struct {
+		name string
+		dc   converter.DataConverter
+		want string
+	}{
+		{"Background", base, "go"},
+		{"Go context", base.WithContext(goCtx), "go"},
+		{"workflow context", base.WithWorkflowContext(wfCtx), "workflow"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, batch := range []bool{false, true} {
+				payload, err := converter.GetDefaultDataConverter().ToPayload(tt.want)
+				require.NoError(t, err)
+				var got contextDispatchModel
+				if batch {
+					err = tt.dc.FromPayloads(&commonpb.Payloads{Payloads: []*commonpb.Payload{payload}}, &got)
+				} else {
+					err = tt.dc.FromPayload(payload, &got)
+				}
+				require.NoError(t, err)
+				if tt.want == "workflow" {
+					require.Equal(t, wfCtx, got.workflowContext)
+					require.Nil(t, got.goContext)
+				} else {
+					require.NotNil(t, got.goContext)
+					require.Nil(t, got.workflowContext)
+					if tt.name == "Go context" {
+						require.Equal(t, goCtx, got.goContext)
+					} else {
+						require.Nil(t, got.goContext.Done())
+						require.NoError(t, got.goContext.Err())
+						_, hasDeadline := got.goContext.Deadline()
+						require.False(t, hasDeadline)
+					}
+				}
+				if batch {
+					payloads, err := tt.dc.ToPayloads(got)
+					require.NoError(t, err)
+					require.Equal(t, payload, payloads.Payloads[0])
+				} else {
+					encoded, err := tt.dc.ToPayload(got)
+					require.NoError(t, err)
+					require.Equal(t, payload, encoded)
+				}
+			}
+		})
+	}
 }

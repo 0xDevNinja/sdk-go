@@ -1,8 +1,6 @@
 package workflow
 
 import (
-	"context"
-
 	"go.temporal.io/sdk/internal"
 )
 
@@ -68,57 +66,31 @@ func NewDisconnectedContext(parent Context) (ctx Context, cancel CancelFunc) {
 	return internal.NewDisconnectedContext(parent)
 }
 
-// ValueWithTransferTypeConverter is an optional interface that values can implement to provide
-// the SDK with a transfer type converter.
+// TransferTypeConverter converts between a model type and its transfer type;
+// see [TransferTypeConvertible] for usage.
+// Implementations must be pure, threadsafe, and deterministic.
 //
-// When implemented, the SDK calls [ValueWithTransferTypeConverter.TransferTypeConverter] before
-// serializing the value. The returned TransferTypeConverter will be used to turn the value
-// into a serializable representation, called a transfer value. The converter will also
-// be used to turn the transfer value back into the original value after deserialization.
+// Outside a workflow, data conversion will invoke ToTransfer/FromTransfer with
+// the context provided by [ContextAware.WithContext] if one is available;
+// otherwise it will use context.Background().
 //
-// This method should be cheap and fast; the SDK may call this method frequently.
-//
-// NOTE: Experimental.
-type ValueWithTransferTypeConverter = internal.ValueWithTransferTypeConverter
+// Inside a workflow, data conversion will instead pass the workflow context
+// provided by [ContextAware.WithWorkflowContext].
+type TransferTypeConverter[Model, Transfer any] = internal.TransferTypeConverter[Model, Transfer]
 
-// TransferTypeConverter converts application values to serializable transfer
-// values and back. Create one using [NewTransferTypeConverter] or
-// [NewContextAwareTransferTypeConverter].
+// TransferTypeConvertible is a marker struct that associates Model with a
+// [TransferTypeConverter].
+//
+// The first time the SDK sees a Model value with an embedded
+// TransferTypeConvertible[Model, Transfer, C], the SDK creates a zero value
+// of C and caches it. Model values will be encoded by first applying
+// C.ToTransfer and then applying the data converter to the resulting
+// Transfer value. To decode a Model value, the SDK gets a Transfer value
+// from the data converter and applies C.FromTransfer to it.
+//
+// The SDK will panic during data conversion if it sees a value of type T that
+// embeds TransferTypeConvertible[A,B,C] where A != T. Do not embed a struct
+// that embeds TransferTypeConvertible inside another struct.
 //
 // NOTE: Experimental.
-type TransferTypeConverter = internal.TransferTypeConverter
-
-// NewTransferTypeConverter builds a [TransferTypeConverter] that can map
-// something of type ModelType into a serializable "transfer value", and back.
-// ModelType must not be a pointer type.
-//
-// NOTE: Experimental.
-func NewTransferTypeConverter[ModelType, TransferType any](
-	toTransferType func(*ModelType) (*TransferType, error),
-	fromTransferType func(*TransferType, *ModelType) error,
-) TransferTypeConverter {
-	return internal.NewTransferTypeConverter(toTransferType, fromTransferType)
-}
-
-// NewContextAwareTransferTypeConverter builds a [TransferTypeConverter] that can map
-// something of type ModelType into a serializable "transfer value", and back.
-// ModelType must not be a pointer type.
-//
-// NOTE: Experimental.
-func NewContextAwareTransferTypeConverter[ModelType, TransferType any](
-	toTransferType func(*ModelType) (*TransferType, error),
-	fromTransferType func(*TransferType, *ModelType) error,
-	toTransferTypeWithContext func(context.Context, *ModelType) (*TransferType, error),
-	fromTransferTypeWithContext func(context.Context, *TransferType, *ModelType) error,
-	toTransferTypeWithWorkflowContext func(Context, *ModelType) (*TransferType, error),
-	fromTransferTypeWithWorkflowContext func(Context, *TransferType, *ModelType) error,
-) TransferTypeConverter {
-	return internal.NewContextAwareTransferTypeConverter(
-		toTransferType,
-		fromTransferType,
-		toTransferTypeWithContext,
-		fromTransferTypeWithContext,
-		toTransferTypeWithWorkflowContext,
-		fromTransferTypeWithWorkflowContext,
-	)
-}
+type TransferTypeConvertible[Model, Transfer any, C TransferTypeConverter[Model, Transfer]] = internal.TransferTypeConvertible[Model, Transfer, C]
